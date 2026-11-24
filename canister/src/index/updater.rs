@@ -163,11 +163,14 @@ fn tick(network: BitcoinNetwork, subscribers: Vec<Principal>) {
 
   ic_cdk::spawn(async move {
     let outcome = index_next_block(network).await;
-    // Free the loop before notifying, so a slow subscriber can't hold up indexing.
+    // Notify before freeing the loop, so subscribers get each block before the next one
+    // is indexed, in height order (as upstream). A slow subscriber delays indexing.
+    if let Ok(Step::Indexed(block)) = &outcome {
+      notify_subscribers(&subscribers, block).await;
+    }
     attempt.finish(outcome.is_ok());
     match outcome {
-      Ok(Step::Done) => {}
-      Ok(Step::Indexed(block)) => notify_subscribers(&subscribers, block).await,
+      Ok(Step::Done | Step::Indexed(_)) => {}
       Ok(Step::Halt(reason)) => {
         log!(
           CRITICAL,
@@ -212,7 +215,7 @@ struct IndexedBlock {
   txids: Vec<String>,
 }
 
-async fn notify_subscribers(subscribers: &[Principal], block: IndexedBlock) {
+async fn notify_subscribers(subscribers: &[Principal], block: &IndexedBlock) {
   for subscriber in subscribers.iter() {
     let _ = crate::notifier::notify_new_block(
       *subscriber,
@@ -239,7 +242,7 @@ async fn index_next_block(network: BitcoinNetwork) -> Result<Step> {
   // Upstream wrote these statistics before the block's first RPC call and the header only
   // at the end. An entry above the tip means a block was left partly applied; retrying
   // on top of it would count it twice. Restore a clean snapshot instead.
-  if crate::index::mem_has_statistics_at(height) {
+  if crate::index::mem_has_statistics_from(height) {
     return Ok(Step::Halt(format!(
       "block {height} was partly applied by an earlier version"
     )));
@@ -821,9 +824,15 @@ mod tests {
 
   #[test]
   fn statistics_above_the_tip_mark_a_partly_applied_block() {
-    assert!(!crate::index::mem_has_statistics_at(HEIGHT));
+    // Rows at or below the tip are normal.
+    crate::index::mem_insert_statistic_runes(HEIGHT - 1, 1);
+    crate::index::mem_insert_statistic_reserved_runes(HEIGHT - 1, 1);
+    assert!(!crate::index::mem_has_statistics_from(HEIGHT));
     // What upstream left behind when a block failed after its first RPC call.
+    crate::index::mem_insert_statistic_reserved_runes(HEIGHT + 1, 2);
+    assert!(crate::index::mem_has_statistics_from(HEIGHT));
+    crate::index::mem_remove_statistic_reserved_runes(HEIGHT + 1);
     crate::index::mem_insert_statistic_runes(HEIGHT, 2);
-    assert!(crate::index::mem_has_statistics_at(HEIGHT));
+    assert!(crate::index::mem_has_statistics_from(HEIGHT));
   }
 }
