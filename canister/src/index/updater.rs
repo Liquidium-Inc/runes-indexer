@@ -7,6 +7,7 @@ use crate::timestamp;
 use candid::Principal;
 use ic_cdk_timers::TimerId;
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::time::Duration;
 
 mod rune_updater;
@@ -32,20 +33,22 @@ impl From<Block> for BlockData {
   }
 }
 
-/// Time between polls when the index is healthy or at the tip.
+/// How often the loop wakes up. Also the wait after a successful block.
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Longest wait between retries after consecutive failures.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(640);
-/// Fallback tick armed at the start of every tick. If the tick traps after its first
-/// await, the IC rolls back what it would have scheduled at the end, and this timer keeps
-/// the loop alive. A healthy tick finishes long before it fires.
-const WATCHDOG_DELAY: Duration = Duration::from_secs(900);
+/// An attempt that has not finished after this long is treated as dead (it trapped after
+/// its first await) and a new one may start.
+const ATTEMPT_LEASE: Duration = Duration::from_secs(900);
 
 thread_local! {
-  /// The single pending tick. Scheduling always replaces it, so `start` can never create
-  /// a second loop.
-  static NEXT_TICK: RefCell<Option<TimerId>> = const { RefCell::new(None) };
-  static CONSECUTIVE_FAILURES: Cell<u32> = const { Cell::new(0) };
+  /// The repeating timer that drives the loop. Repeating timers are rescheduled even when
+  /// their callback traps, so a trap can't stop indexing.
+  static LOOP_TIMER: RefCell<Option<TimerId>> = const { RefCell::new(None) };
+  static SCHEDULER: RefCell<Scheduler> = RefCell::new(Scheduler::default());
+  /// Bumped on every change to the index (block applied or rolled back). Work prepared
+  /// against an older version is thrown away.
+  static INDEX_VERSION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn retry_delay(consecutive_failures: u32) -> Duration {
@@ -57,65 +60,108 @@ pub(crate) fn retry_delay(consecutive_failures: u32) -> Duration {
     .min(MAX_RETRY_DELAY)
 }
 
-/// Starts (or restarts) the index loop: the next tick runs in `POLL_INTERVAL`, replacing
-/// any tick that was already pending.
+/// Decides when an attempt may start. Times are IC nanoseconds.
+#[derive(Default, Debug)]
+pub(crate) struct Scheduler {
+  failures: u32,
+  next_attempt_at: u64,
+  /// (attempt id, start time) of the attempt that owns the loop.
+  in_flight: Option<(u64, u64)>,
+  last_id: u64,
+}
+
+impl Scheduler {
+  /// Starts an attempt if none is running (or the running one outlived its lease) and its
+  /// backoff has passed. The attempt is counted as failed until `finish` says otherwise,
+  /// so a trap later in the attempt still backs off.
+  pub(crate) fn begin(&mut self, now: u64) -> Option<u64> {
+    if let Some((_, started)) = self.in_flight {
+      if now < started.saturating_add(ATTEMPT_LEASE.as_nanos() as u64) {
+        return None;
+      }
+    }
+    if now < self.next_attempt_at {
+      return None;
+    }
+    self.failures = self.failures.saturating_add(1);
+    self.next_attempt_at = now.saturating_add(retry_delay(self.failures).as_nanos() as u64);
+    self.last_id += 1;
+    self.in_flight = Some((self.last_id, now));
+    Some(self.last_id)
+  }
+
+  /// Ends an attempt. Returns false, and changes nothing, if a newer attempt took over.
+  pub(crate) fn finish(&mut self, id: u64, succeeded: bool) -> bool {
+    if self.in_flight.map(|(current, _)| current) != Some(id) {
+      return false;
+    }
+    self.in_flight = None;
+    if succeeded {
+      self.failures = 0;
+      self.next_attempt_at = 0;
+    }
+    true
+  }
+
+  pub(crate) fn idle(&self) -> bool {
+    self.in_flight.is_none()
+  }
+
+  pub(crate) fn retry_in(&self, now: u64) -> Duration {
+    Duration::from_nanos(self.next_attempt_at.saturating_sub(now))
+  }
+}
+
+/// Starts (or restarts) the index loop. There is only ever one loop timer.
 pub fn update_index(network: BitcoinNetwork, subscribers: Vec<Principal>) -> Result {
-  schedule_tick(POLL_INTERVAL, network, subscribers);
+  stop_loop();
+  let id =
+    ic_cdk_timers::set_timer_interval(POLL_INTERVAL, move || tick(network, subscribers.clone()));
+  LOOP_TIMER.with(|t| *t.borrow_mut() = Some(id));
   Ok(())
 }
 
-fn schedule_tick(delay: Duration, network: BitcoinNetwork, subscribers: Vec<Principal>) {
-  clear_pending_tick();
-  let id = ic_cdk_timers::set_timer(delay, move || tick(network, subscribers));
-  NEXT_TICK.with(|t| *t.borrow_mut() = Some(id));
-}
-
-fn clear_pending_tick() {
-  if let Some(id) = NEXT_TICK.with(|t| t.borrow_mut().take()) {
+fn stop_loop() {
+  if let Some(id) = LOOP_TIMER.with(|t| t.borrow_mut().take()) {
     ic_cdk_timers::clear_timer(id);
   }
 }
 
 fn tick(network: BitcoinNetwork, subscribers: Vec<Principal>) {
   if is_shutting_down() {
-    log!(INFO, "shutting down index thread");
-    clear_pending_tick();
+    if SCHEDULER.with_borrow(|s| s.idle()) {
+      log!(INFO, "shutting down index thread");
+      stop_loop();
+    }
     return;
   }
 
-  // Count this attempt as a failure and arm the watchdog before the first await, so both
-  // are committed even if a later part of this tick traps.
-  let failures = CONSECUTIVE_FAILURES.with(|f| {
-    f.set(f.get().saturating_add(1));
-    f.get()
-  });
-  schedule_tick(
-    WATCHDOG_DELAY.max(retry_delay(failures)),
-    network,
-    subscribers.clone(),
-  );
+  let Some(id) = SCHEDULER.with_borrow_mut(|s| s.begin(ic_cdk::api::time())) else {
+    return;
+  };
 
   ic_cdk::spawn(async move {
-    let delay = match index_next_block(network, &subscribers).await {
-      Ok(()) => {
-        CONSECUTIVE_FAILURES.with(|f| f.set(0));
-        POLL_INTERVAL
+    let outcome = index_next_block(network, &subscribers).await;
+    if !SCHEDULER.with_borrow_mut(|s| s.finish(id, outcome.is_ok())) {
+      log!(
+        INFO,
+        "attempt {id} finished after a newer one took over; ignored"
+      );
+      return;
+    }
+    match outcome {
+      Ok(Step::Done) => {}
+      Ok(Step::Halt(reason)) => {
+        log!(
+          CRITICAL,
+          "{reason}; indexing halted until a controller fixes this and calls start"
+        );
+        stop_loop();
       }
       Err(e) => {
-        let delay = retry_delay(failures);
-        log_critical_once(format!(
-          "{e:#} (attempt {failures}, retrying in {}s)",
-          delay.as_secs()
-        ));
-        delay
+        let retry_in = SCHEDULER.with_borrow(|s| s.retry_in(ic_cdk::api::time()));
+        log_critical_once(format!("{e:#} (retrying in {}s)", retry_in.as_secs()));
       }
-    };
-
-    if is_shutting_down() {
-      log!(INFO, "shutting down index thread");
-      clear_pending_tick();
-    } else {
-      schedule_tick(delay, network, subscribers);
     }
   });
 }
@@ -132,14 +178,30 @@ fn log_critical_once(message: String) {
   }
 }
 
-async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) -> Result {
+enum Step {
+  Done,
+  /// Retrying cannot help; a controller has to act.
+  Halt(String),
+}
+
+async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) -> Result<Step> {
+  let version = INDEX_VERSION.get();
   let (height, index_prev_blockhash) = crate::index::next_block(network);
+
+  // Upstream wrote these statistics before the block's first RPC call and the header only
+  // at the end. An entry above the tip means a block was left partly applied; retrying
+  // on top of it would count it twice. Restore a clean snapshot instead.
+  if crate::index::mem_has_statistics_at(height) {
+    return Ok(Step::Halt(format!(
+      "block {height} was partly applied by an earlier version"
+    )));
+  }
 
   let Some(block_hash) = crate::bitcoin_api::get_block_hash(network, height)
     .await
     .map_err(|e| anyhow!("failed to get_block_hash at height {height}: {e:?}"))?
   else {
-    return Ok(());
+    return Ok(Step::Done);
   };
 
   let block = crate::rpc::get_block(block_hash)
@@ -156,16 +218,20 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
   {
     Ok(()) => {}
     Err(reorg::Error::Recoverable { height, depth }) => {
-      ensure_tip_unchanged(network, height, index_prev_blockhash)?;
+      ensure_unchanged(version, height)?;
       Reorg::handle_reorg(height, depth);
-      return Ok(());
+      INDEX_VERSION.set(version + 1);
+      return Ok(Step::Done);
     }
     Err(reorg::Error::Retry) => {
-      log!(INFO, "retry reorg detected at height {}", height);
-      return Ok(());
+      return Err(anyhow!(
+        "could not fetch a block hash while checking a reorg at height {height}"
+      ));
     }
     Err(reorg::Error::Unrecoverable) => {
-      return Err(anyhow!("unrecoverable reorg detected at height {height}"));
+      return Ok(Step::Halt(format!(
+        "unrecoverable reorg detected at height {height}"
+      )));
     }
   }
 
@@ -176,7 +242,7 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
 
   // From here to the end of index_block there is no await, so the IC commits the whole
   // block together with its header, or none of it if anything traps.
-  ensure_tip_unchanged(network, height, index_prev_blockhash)?;
+  ensure_unchanged(version, height)?;
   let txids: Vec<String> = block
     .txdata
     .iter()
@@ -184,11 +250,12 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
     .collect();
   let block_timestamp = block.header.time as u64;
   if let Err(e) = index_block(network, height, &block, commitments) {
-    // Trapping rolls back every write of this block. The tick's failure count and
-    // watchdog were committed before the first await, so the loop retries with backoff.
+    // Trapping rolls back every write of this block. The attempt is already counted as
+    // failed and holds a lease, so the loop retries after the lease with backoff.
     ic_cdk::trap(&format!("failed to index_block at height {height}: {e:?}"));
   }
   Reorg::prune_change_record(network, height);
+  INDEX_VERSION.set(version + 1);
 
   for subscriber in subscribers.iter() {
     let _ = crate::notifier::notify_new_block(
@@ -209,19 +276,15 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
     );
   }
 
-  Ok(())
+  Ok(Step::Done)
 }
 
-/// Ticks can overlap if one runs longer than the watchdog. Only the one that still sees
-/// the tip it started from may write.
-fn ensure_tip_unchanged(
-  network: BitcoinNetwork,
-  height: u32,
-  index_prev_blockhash: Option<BlockHash>,
-) -> Result {
-  if crate::index::next_block(network) != (height, index_prev_blockhash) {
+/// Attempts only overlap when one outlives its lease. Only an attempt whose view of the
+/// index is still current may write.
+fn ensure_unchanged(version: u64, height: u32) -> Result {
+  if INDEX_VERSION.get() != version {
     return Err(anyhow!(
-      "index moved while block {height} was being fetched; skipping"
+      "index changed while block {height} was being fetched; skipping"
     ));
   }
   Ok(())
@@ -286,6 +349,9 @@ pub(crate) async fn prefetch_commitments(
 ) -> Result<HashMap<u32, bool>> {
   let minimum = Rune::minimum_at_height(bitcoin_network(network), Height(height));
   let mut commitments = HashMap::new();
+  // Runes this block will etch. `etched` skips a later etching of the same name because
+  // the rune exists by then, so its commitment is never needed.
+  let mut etched_in_block = HashSet::new();
 
   for (tx_index, (tx, _)) in block.txdata.iter().enumerate() {
     let rune = match Runestone::decipher(tx) {
@@ -302,15 +368,17 @@ pub(crate) async fn prefetch_commitments(
     // while a block is applied, so a rune that exists now also exists then.
     if rune < minimum
       || rune.is_reserved()
+      || etched_in_block.contains(&rune.0)
       || crate::index::mem_get_rune_to_rune_id(rune.store()).is_some()
     {
       continue;
     }
 
-    commitments.insert(
-      u32::try_from(tx_index).unwrap(),
-      tx_commits_to_rune(lookup, height, tx, rune).await?,
-    );
+    let commits = tx_commits_to_rune(lookup, height, tx, rune).await?;
+    if commits {
+      etched_in_block.insert(rune.0);
+    }
+    commitments.insert(u32::try_from(tx_index).unwrap(), commits);
   }
 
   Ok(commitments)
@@ -667,6 +735,85 @@ mod tests {
     assert_eq!(retry_delay(3), Duration::from_secs(80));
     assert_eq!(retry_delay(6), MAX_RETRY_DELAY);
     assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
-    assert!(WATCHDOG_DELAY > MAX_RETRY_DELAY);
+    assert!(ATTEMPT_LEASE > MAX_RETRY_DELAY);
+  }
+
+  const SEC: u64 = 1_000_000_000;
+
+  #[test]
+  fn scheduler_runs_one_attempt_at_a_time_and_backs_off() {
+    let mut s = Scheduler::default();
+    let first = s.begin(0).unwrap();
+    assert_eq!(
+      s.begin(10 * SEC),
+      None,
+      "no second attempt while one is running"
+    );
+
+    assert!(s.finish(first, false));
+    assert_eq!(s.begin(10 * SEC), None, "backoff after one failure is 20 s");
+    let second = s.begin(20 * SEC).unwrap();
+    assert!(s.finish(second, false));
+    assert_eq!(s.begin(50 * SEC), None, "40 s after two failures");
+    let third = s.begin(60 * SEC).unwrap();
+
+    assert!(s.finish(third, true));
+    assert!(s.begin(60 * SEC).is_some(), "success clears the backoff");
+  }
+
+  #[test]
+  fn scheduler_recovers_from_an_attempt_that_trapped() {
+    let mut s = Scheduler::default();
+    let dead = s.begin(0).unwrap(); // traps after its first await and never finishes
+    let lease = ATTEMPT_LEASE.as_secs() * SEC;
+    assert_eq!(s.begin(lease - 1), None);
+    let next = s.begin(lease).unwrap();
+
+    // The dead attempt's late completion must not touch the new attempt's state.
+    assert!(!s.finish(dead, true));
+    assert!(!s.idle());
+    assert!(s.finish(next, true));
+    assert!(s.idle());
+  }
+
+  #[test]
+  fn prefetch_does_not_check_a_name_already_etched_earlier_in_the_block() {
+    let holder = outpoint(7, 0);
+    seed(holder);
+    let mut block = reporter_block(holder);
+    let mut duplicate = block.txdata[1].0.clone();
+    duplicate.input[0].previous_output = outpoint(8, 0);
+    let txid = duplicate.compute_txid();
+    block.txdata.push((duplicate, txid));
+
+    struct OnlyFirst;
+    impl CommitLookup for OnlyFirst {
+      async fn taproot_output_height(&self, outpoint: OutPoint) -> Result<Option<u32>> {
+        if outpoint.txid == Txid::from_byte_array([9; 32]) {
+          Ok(Some(HEIGHT - 10))
+        } else {
+          Err(anyhow!("lookup for the duplicate must not happen"))
+        }
+      }
+    }
+
+    let commitments = block_on(prefetch_commitments(&OnlyFirst, NETWORK, HEIGHT, &block)).unwrap();
+    assert_eq!(commitments, HashMap::from([(1, true)]));
+    index_block(NETWORK, HEIGHT, &block, commitments).unwrap();
+    assert_eq!(
+      crate::index::mem_get_rune_to_rune_id(ETCHED.store()).map(RuneId::load),
+      Some(RuneId {
+        block: HEIGHT.into(),
+        tx: 1
+      })
+    );
+  }
+
+  #[test]
+  fn statistics_above_the_tip_mark_a_partly_applied_block() {
+    assert!(!crate::index::mem_has_statistics_at(HEIGHT));
+    // What upstream left behind when a block failed after its first RPC call.
+    crate::index::mem_insert_statistic_runes(HEIGHT, 2);
+    assert!(crate::index::mem_has_statistics_at(HEIGHT));
   }
 }

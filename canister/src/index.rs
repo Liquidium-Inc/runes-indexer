@@ -204,6 +204,12 @@ pub fn mem_prune_statistic_reserved_runes(height: u32) {
   });
 }
 
+/// Whether runes statistics were recorded for `height`.
+pub(crate) fn mem_has_statistics_at(height: u32) -> bool {
+  HEIGHT_TO_STATISTIC_RUNES.with(|m| m.borrow().contains_key(&height))
+    || HEIGHT_TO_STATISTIC_RESERVED_RUNES.with(|m| m.borrow().contains_key(&height))
+}
+
 pub fn mem_statistic_runes() -> u64 {
   HEIGHT_TO_STATISTIC_RUNES.with(|m| {
     m.borrow()
