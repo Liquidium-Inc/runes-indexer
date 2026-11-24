@@ -6,6 +6,7 @@ use crate::logs::{CRITICAL, INFO, WARNING};
 use crate::timestamp;
 use candid::Principal;
 use ic_cdk_timers::TimerId;
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -42,6 +43,8 @@ thread_local! {
   /// their callback traps, so a trap can't stop indexing.
   static LOOP_TIMER: RefCell<Option<TimerId>> = const { RefCell::new(None) };
   static SCHEDULER: RefCell<Scheduler> = RefCell::new(Scheduler::default());
+  /// Bumped by every `start`, so an attempt from before a restart can't halt the new loop.
+  static LOOP_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn retry_delay(consecutive_failures: u32) -> Duration {
@@ -66,9 +69,8 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-  /// Starts an attempt if none is running and the backoff has passed. Until `finish`, the
-  /// attempt counts as failed and the next one is pushed back, so an attempt that traps
-  /// (and only gets `release`d) still backs off.
+  /// Starts an attempt if none is running and the backoff has passed. The attempt counts
+  /// as failed until `finish` says otherwise.
   pub(crate) fn begin(&mut self, now: u64) -> bool {
     if self.in_flight || now < self.next_attempt_at {
       return false;
@@ -90,9 +92,9 @@ impl Scheduler {
     }
   }
 
-  /// Ends an attempt that trapped. Keeps the backoff `begin` set.
-  pub(crate) fn release(&mut self) {
-    self.in_flight = false;
+  /// Ends an attempt that trapped. Like a failed `finish`.
+  pub(crate) fn release(&mut self, now: u64) {
+    self.finish(now, false);
   }
 
   pub(crate) fn idle(&self) -> bool {
@@ -121,7 +123,8 @@ impl Attempt {
 impl Drop for Attempt {
   fn drop(&mut self) {
     if !self.finished {
-      SCHEDULER.with_borrow_mut(|s| s.release());
+      // ic0.time is available in the cleanup callback.
+      SCHEDULER.with_borrow_mut(|s| s.release(ic_cdk::api::time()));
     }
   }
 }
@@ -130,6 +133,7 @@ impl Drop for Attempt {
 /// already running carries on and keeps the loop to itself until it ends.
 pub fn update_index(network: BitcoinNetwork, subscribers: Vec<Principal>) -> Result {
   stop_loop();
+  LOOP_GENERATION.set(LOOP_GENERATION.get() + 1);
   let id =
     ic_cdk_timers::set_timer_interval(POLL_INTERVAL, move || tick(network, subscribers.clone()));
   LOOP_TIMER.with(|t| *t.borrow_mut() = Some(id));
@@ -155,18 +159,23 @@ fn tick(network: BitcoinNetwork, subscribers: Vec<Principal>) {
     return;
   }
   let attempt = Attempt { finished: false };
+  let generation = LOOP_GENERATION.get();
 
   ic_cdk::spawn(async move {
-    let outcome = index_next_block(network, &subscribers).await;
+    let outcome = index_next_block(network).await;
+    // Free the loop before notifying, so a slow subscriber can't hold up indexing.
     attempt.finish(outcome.is_ok());
     match outcome {
       Ok(Step::Done) => {}
+      Ok(Step::Indexed(block)) => notify_subscribers(&subscribers, block).await,
       Ok(Step::Halt(reason)) => {
         log!(
           CRITICAL,
           "{reason}; indexing halted until a controller fixes this and calls start"
         );
-        stop_loop();
+        if LOOP_GENERATION.get() == generation {
+          stop_loop();
+        }
       }
       Err(e) => {
         let retry_in = SCHEDULER.with_borrow(|s| s.retry_in(ic_cdk::api::time()));
@@ -189,12 +198,42 @@ fn log_critical_once(message: String) {
 }
 
 enum Step {
+  /// Nothing new to index, or a reorg was rolled back.
   Done,
+  Indexed(IndexedBlock),
   /// Retrying cannot help; a controller has to act.
   Halt(String),
 }
 
-async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) -> Result<Step> {
+struct IndexedBlock {
+  height: u32,
+  hash: BlockHash,
+  timestamp: u64,
+  txids: Vec<String>,
+}
+
+async fn notify_subscribers(subscribers: &[Principal], block: IndexedBlock) {
+  for subscriber in subscribers.iter() {
+    let _ = crate::notifier::notify_new_block(
+      *subscriber,
+      block.height,
+      block.hash.to_string(),
+      block.timestamp,
+      block.txids.clone(),
+    )
+    .await;
+    log!(
+      INFO,
+      "notified subscriber: {:?} with block_height: {:?} block_hash: {:?} block_timestamp: {:?}",
+      subscriber.to_text(),
+      block.height,
+      block.hash,
+      block.timestamp
+    );
+  }
+}
+
+async fn index_next_block(network: BitcoinNetwork) -> Result<Step> {
   let (height, index_prev_blockhash) = crate::index::next_block(network);
 
   // Upstream wrote these statistics before the block's first RPC call and the header only
@@ -262,26 +301,12 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
   }
   Reorg::prune_change_record(network, height);
 
-  for subscriber in subscribers.iter() {
-    let _ = crate::notifier::notify_new_block(
-      *subscriber,
-      height,
-      block_hash.to_string(),
-      block_timestamp,
-      txids.clone(),
-    )
-    .await;
-    log!(
-      INFO,
-      "notified subscriber: {:?} with block_height: {:?} block_hash: {:?} block_timestamp: {:?}",
-      subscriber.to_text(),
-      height,
-      block_hash,
-      block_timestamp
-    );
-  }
-
-  Ok(Step::Done)
+  Ok(Step::Indexed(IndexedBlock {
+    height,
+    hash: block_hash,
+    timestamp: block_timestamp,
+    txids,
+  }))
 }
 
 fn bitcoin_network(network: BitcoinNetwork) -> bitcoin::Network {
@@ -755,10 +780,10 @@ mod tests {
   fn scheduler_after_a_trapped_attempt_still_backs_off() {
     let mut s = Scheduler::default();
     assert!(s.begin(0));
-    s.release(); // trapped: its guard was dropped in the cleanup callback
+    s.release(45 * SEC); // trapped after 45 s: its guard was dropped in cleanup
     assert!(s.idle());
-    assert!(!s.begin(10 * SEC), "the backoff set by begin still applies");
-    assert!(s.begin(20 * SEC));
+    assert!(!s.begin(60 * SEC), "backoff runs from the trap");
+    assert!(s.begin(65 * SEC));
   }
 
   #[test]
