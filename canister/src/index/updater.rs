@@ -6,7 +6,6 @@ use crate::logs::{CRITICAL, INFO, WARNING};
 use crate::timestamp;
 use candid::Principal;
 use ic_cdk_timers::TimerId;
-use std::cell::Cell;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -37,18 +36,12 @@ impl From<Block> for BlockData {
 const POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// Longest wait between retries after consecutive failures.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(640);
-/// An attempt that has not finished after this long is treated as dead (it trapped after
-/// its first await) and a new one may start.
-const ATTEMPT_LEASE: Duration = Duration::from_secs(900);
 
 thread_local! {
   /// The repeating timer that drives the loop. Repeating timers are rescheduled even when
   /// their callback traps, so a trap can't stop indexing.
   static LOOP_TIMER: RefCell<Option<TimerId>> = const { RefCell::new(None) };
   static SCHEDULER: RefCell<Scheduler> = RefCell::new(Scheduler::default());
-  /// Bumped on every change to the index (block applied or rolled back). Work prepared
-  /// against an older version is thrown away.
-  static INDEX_VERSION: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) fn retry_delay(consecutive_failures: u32) -> Duration {
@@ -60,51 +53,50 @@ pub(crate) fn retry_delay(consecutive_failures: u32) -> Duration {
     .min(MAX_RETRY_DELAY)
 }
 
+fn nanos(d: Duration) -> u64 {
+  d.as_nanos() as u64
+}
+
 /// Decides when an attempt may start. Times are IC nanoseconds.
 #[derive(Default, Debug)]
 pub(crate) struct Scheduler {
   failures: u32,
   next_attempt_at: u64,
-  /// (attempt id, start time) of the attempt that owns the loop.
-  in_flight: Option<(u64, u64)>,
-  last_id: u64,
+  in_flight: bool,
 }
 
 impl Scheduler {
-  /// Starts an attempt if none is running (or the running one outlived its lease) and its
-  /// backoff has passed. The attempt is counted as failed until `finish` says otherwise,
-  /// so a trap later in the attempt still backs off.
-  pub(crate) fn begin(&mut self, now: u64) -> Option<u64> {
-    if let Some((_, started)) = self.in_flight {
-      if now < started.saturating_add(ATTEMPT_LEASE.as_nanos() as u64) {
-        return None;
-      }
-    }
-    if now < self.next_attempt_at {
-      return None;
-    }
-    self.failures = self.failures.saturating_add(1);
-    self.next_attempt_at = now.saturating_add(retry_delay(self.failures).as_nanos() as u64);
-    self.last_id += 1;
-    self.in_flight = Some((self.last_id, now));
-    Some(self.last_id)
-  }
-
-  /// Ends an attempt. Returns false, and changes nothing, if a newer attempt took over.
-  pub(crate) fn finish(&mut self, id: u64, succeeded: bool) -> bool {
-    if self.in_flight.map(|(current, _)| current) != Some(id) {
+  /// Starts an attempt if none is running and the backoff has passed. Until `finish`, the
+  /// attempt counts as failed and the next one is pushed back, so an attempt that traps
+  /// (and only gets `release`d) still backs off.
+  pub(crate) fn begin(&mut self, now: u64) -> bool {
+    if self.in_flight || now < self.next_attempt_at {
       return false;
     }
-    self.in_flight = None;
-    if succeeded {
-      self.failures = 0;
-      self.next_attempt_at = 0;
-    }
+    self.in_flight = true;
+    self.failures = self.failures.saturating_add(1);
+    self.next_attempt_at = now.saturating_add(nanos(retry_delay(self.failures)));
     true
   }
 
+  /// Ends an attempt that returned. The backoff runs from now, not from when it started.
+  pub(crate) fn finish(&mut self, now: u64, succeeded: bool) {
+    self.in_flight = false;
+    if succeeded {
+      self.failures = 0;
+      self.next_attempt_at = 0;
+    } else {
+      self.next_attempt_at = now.saturating_add(nanos(retry_delay(self.failures)));
+    }
+  }
+
+  /// Ends an attempt that trapped. Keeps the backoff `begin` set.
+  pub(crate) fn release(&mut self) {
+    self.in_flight = false;
+  }
+
   pub(crate) fn idle(&self) -> bool {
-    self.in_flight.is_none()
+    !self.in_flight
   }
 
   pub(crate) fn retry_in(&self, now: u64) -> Duration {
@@ -112,7 +104,30 @@ impl Scheduler {
   }
 }
 
-/// Starts (or restarts) the index loop. There is only ever one loop timer.
+/// Owns the running attempt. If the attempt traps in a call callback, ic-cdk drops the
+/// task in the cleanup callback, which runs this `Drop` and frees the loop for the next
+/// attempt. Only one attempt ever runs, so attempts never race each other.
+struct Attempt {
+  finished: bool,
+}
+
+impl Attempt {
+  fn finish(mut self, succeeded: bool) {
+    self.finished = true;
+    SCHEDULER.with_borrow_mut(|s| s.finish(ic_cdk::api::time(), succeeded));
+  }
+}
+
+impl Drop for Attempt {
+  fn drop(&mut self) {
+    if !self.finished {
+      SCHEDULER.with_borrow_mut(|s| s.release());
+    }
+  }
+}
+
+/// Starts (or restarts) the index loop. There is only ever one loop timer; an attempt
+/// already running carries on and keeps the loop to itself until it ends.
 pub fn update_index(network: BitcoinNetwork, subscribers: Vec<Principal>) -> Result {
   stop_loop();
   let id =
@@ -136,19 +151,14 @@ fn tick(network: BitcoinNetwork, subscribers: Vec<Principal>) {
     return;
   }
 
-  let Some(id) = SCHEDULER.with_borrow_mut(|s| s.begin(ic_cdk::api::time())) else {
+  if !SCHEDULER.with_borrow_mut(|s| s.begin(ic_cdk::api::time())) {
     return;
-  };
+  }
+  let attempt = Attempt { finished: false };
 
   ic_cdk::spawn(async move {
     let outcome = index_next_block(network, &subscribers).await;
-    if !SCHEDULER.with_borrow_mut(|s| s.finish(id, outcome.is_ok())) {
-      log!(
-        INFO,
-        "attempt {id} finished after a newer one took over; ignored"
-      );
-      return;
-    }
+    attempt.finish(outcome.is_ok());
     match outcome {
       Ok(Step::Done) => {}
       Ok(Step::Halt(reason)) => {
@@ -185,7 +195,6 @@ enum Step {
 }
 
 async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) -> Result<Step> {
-  let version = INDEX_VERSION.get();
   let (height, index_prev_blockhash) = crate::index::next_block(network);
 
   // Upstream wrote these statistics before the block's first RPC call and the header only
@@ -218,9 +227,7 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
   {
     Ok(()) => {}
     Err(reorg::Error::Recoverable { height, depth }) => {
-      ensure_unchanged(version, height)?;
       Reorg::handle_reorg(height, depth);
-      INDEX_VERSION.set(version + 1);
       return Ok(Step::Done);
     }
     Err(reorg::Error::Retry) => {
@@ -242,7 +249,6 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
 
   // From here to the end of index_block there is no await, so the IC commits the whole
   // block together with its header, or none of it if anything traps.
-  ensure_unchanged(version, height)?;
   let txids: Vec<String> = block
     .txdata
     .iter()
@@ -251,11 +257,10 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
   let block_timestamp = block.header.time as u64;
   if let Err(e) = index_block(network, height, &block, commitments) {
     // Trapping rolls back every write of this block. The attempt is already counted as
-    // failed and holds a lease, so the loop retries after the lease with backoff.
+    // failed and its guard frees the loop, so the next tick retries with backoff.
     ic_cdk::trap(&format!("failed to index_block at height {height}: {e:?}"));
   }
   Reorg::prune_change_record(network, height);
-  INDEX_VERSION.set(version + 1);
 
   for subscriber in subscribers.iter() {
     let _ = crate::notifier::notify_new_block(
@@ -277,17 +282,6 @@ async fn index_next_block(network: BitcoinNetwork, subscribers: &[Principal]) ->
   }
 
   Ok(Step::Done)
-}
-
-/// Attempts only overlap when one outlives its lease. Only an attempt whose view of the
-/// index is still current may write.
-fn ensure_unchanged(version: u64, height: u32) -> Result {
-  if INDEX_VERSION.get() != version {
-    return Err(anyhow!(
-      "index changed while block {height} was being fetched; skipping"
-    ));
-  }
-  Ok(())
 }
 
 fn bitcoin_network(network: BitcoinNetwork) -> bitcoin::Network {
@@ -735,7 +729,6 @@ mod tests {
     assert_eq!(retry_delay(3), Duration::from_secs(80));
     assert_eq!(retry_delay(6), MAX_RETRY_DELAY);
     assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
-    assert!(ATTEMPT_LEASE > MAX_RETRY_DELAY);
   }
 
   const SEC: u64 = 1_000_000_000;
@@ -743,37 +736,29 @@ mod tests {
   #[test]
   fn scheduler_runs_one_attempt_at_a_time_and_backs_off() {
     let mut s = Scheduler::default();
-    let first = s.begin(0).unwrap();
-    assert_eq!(
-      s.begin(10 * SEC),
-      None,
-      "no second attempt while one is running"
-    );
+    assert!(s.begin(0));
+    assert!(!s.begin(10 * SEC), "no second attempt while one is running");
 
-    assert!(s.finish(first, false));
-    assert_eq!(s.begin(10 * SEC), None, "backoff after one failure is 20 s");
-    let second = s.begin(20 * SEC).unwrap();
-    assert!(s.finish(second, false));
-    assert_eq!(s.begin(50 * SEC), None, "40 s after two failures");
-    let third = s.begin(60 * SEC).unwrap();
+    // A slow failure: the backoff runs from when it ended.
+    s.finish(45 * SEC, false);
+    assert!(!s.begin(60 * SEC), "backoff after one failure is 20 s");
+    assert!(s.begin(65 * SEC));
+    s.finish(65 * SEC, false);
+    assert!(!s.begin(100 * SEC), "40 s after two failures");
+    assert!(s.begin(105 * SEC));
 
-    assert!(s.finish(third, true));
-    assert!(s.begin(60 * SEC).is_some(), "success clears the backoff");
+    s.finish(105 * SEC, true);
+    assert!(s.begin(105 * SEC), "success clears the backoff");
   }
 
   #[test]
-  fn scheduler_recovers_from_an_attempt_that_trapped() {
+  fn scheduler_after_a_trapped_attempt_still_backs_off() {
     let mut s = Scheduler::default();
-    let dead = s.begin(0).unwrap(); // traps after its first await and never finishes
-    let lease = ATTEMPT_LEASE.as_secs() * SEC;
-    assert_eq!(s.begin(lease - 1), None);
-    let next = s.begin(lease).unwrap();
-
-    // The dead attempt's late completion must not touch the new attempt's state.
-    assert!(!s.finish(dead, true));
-    assert!(!s.idle());
-    assert!(s.finish(next, true));
+    assert!(s.begin(0));
+    s.release(); // trapped: its guard was dropped in the cleanup callback
     assert!(s.idle());
+    assert!(!s.begin(10 * SEC), "the backoff set by begin still applies");
+    assert!(s.begin(20 * SEC));
   }
 
   #[test]
