@@ -1,11 +1,12 @@
 use super::*;
 use crate::index::entry::RuneBalance;
 use crate::into_usize::IntoUsize;
-use crate::logs::WARNING;
 
 pub(super) struct RuneUpdater {
   pub(super) block_time: u32,
   pub(super) burned: HashMap<RuneId, Lot>,
+  /// Result of `tx_commits_to_rune`, fetched before the block is applied, by tx index.
+  pub(super) commitments: HashMap<u32, bool>,
   pub(super) height: u32,
   pub(super) minimum: Rune,
   pub(super) runes: u64,
@@ -13,12 +14,7 @@ pub(super) struct RuneUpdater {
 }
 
 impl RuneUpdater {
-  pub(super) async fn index_runes(
-    &mut self,
-    tx_index: u32,
-    tx: &Transaction,
-    txid: Txid,
-  ) -> Result<()> {
+  pub(super) fn index_runes(&mut self, tx_index: u32, tx: &Transaction, txid: Txid) -> Result<()> {
     let artifact = Runestone::decipher(tx);
 
     let mut unallocated = self.unallocated(tx)?;
@@ -41,7 +37,7 @@ impl RuneUpdater {
         }
       }
 
-      let etched = self.etched(tx_index, tx, artifact).await?;
+      let etched = self.etched(tx_index, artifact)?;
 
       if let Artifact::Runestone(runestone) = artifact {
         if let Some((id, ..)) = etched {
@@ -318,12 +314,7 @@ impl RuneUpdater {
     Ok(())
   }
 
-  async fn etched(
-    &mut self,
-    tx_index: u32,
-    tx: &Transaction,
-    artifact: &Artifact,
-  ) -> Result<Option<(RuneId, Rune)>> {
+  fn etched(&mut self, tx_index: u32, artifact: &Artifact) -> Result<Option<(RuneId, Rune)>> {
     let rune = match artifact {
       Artifact::Runestone(runestone) => match runestone.etching {
         Some(etching) => etching.rune,
@@ -339,7 +330,12 @@ impl RuneUpdater {
       if rune < self.minimum
         || rune.is_reserved()
         || crate::index::mem_get_rune_to_rune_id(rune.store()).is_some()
-        || !self.tx_commits_to_rune(tx, rune).await?
+        || !self.commitments.get(&tx_index).copied().ok_or_else(|| {
+          anyhow!(
+            "no commitment check fetched for tx {tx_index} at height {}",
+            self.height
+          )
+        })?
       {
         return Ok(None);
       }
@@ -379,65 +375,6 @@ impl RuneUpdater {
     crate::index::mem_insert_rune_id_to_rune_entry(id.store(), rune_entry);
 
     Ok(Some(Lot(amount)))
-  }
-
-  async fn tx_commits_to_rune(&self, tx: &Transaction, rune: Rune) -> Result<bool> {
-    let commitment = rune.commitment();
-
-    for input in &tx.input {
-      // extracting a tapscript does not indicate that the input being spent
-      // was actually a taproot output. this is checked below, when we load the
-      // output's entry from the database
-      let Some(tapscript) = input.witness.tapscript() else {
-        continue;
-      };
-
-      for instruction in tapscript.instructions() {
-        // ignore errors, since the extracted script may not be valid
-        let Ok(instruction) = instruction else {
-          break;
-        };
-
-        let Some(pushbytes) = instruction.push_bytes() else {
-          continue;
-        };
-
-        if pushbytes.as_bytes() != commitment {
-          continue;
-        }
-
-        let tx_info =
-          crate::rpc::get_raw_transaction_info(&input.previous_output.txid, None).await?;
-
-        let taproot = tx_info.vout[input.previous_output.vout.into_usize()]
-          .script_pub_key
-          .script()?
-          .is_p2tr();
-
-        if !taproot {
-          continue;
-        }
-
-        let block_hash = tx_info.blockhash.ok_or_else(|| {
-          log!(WARNING, "Transaction {} has no block hash", tx_info.txid);
-          anyhow!("Transaction {} has no block hash", tx_info.txid)
-        })?;
-
-        let commit_tx_height = crate::rpc::get_block_header_info(&block_hash).await?.height;
-
-        let confirmations = self
-          .height
-          .checked_sub(commit_tx_height.try_into().unwrap())
-          .unwrap()
-          + 1;
-
-        if confirmations >= Runestone::COMMIT_CONFIRMATIONS as u32 {
-          return Ok(true);
-        }
-      }
-    }
-
-    Ok(false)
   }
 
   fn unallocated(&mut self, tx: &Transaction) -> Result<HashMap<RuneId, Lot>> {

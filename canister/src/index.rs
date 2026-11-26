@@ -204,6 +204,12 @@ pub fn mem_prune_statistic_reserved_runes(height: u32) {
   });
 }
 
+/// Whether runes statistics were recorded at `height` or above.
+pub(crate) fn mem_has_statistics_from(height: u32) -> bool {
+  HEIGHT_TO_STATISTIC_RUNES.with(|m| m.borrow().range(height..).next().is_some())
+    || HEIGHT_TO_STATISTIC_RESERVED_RUNES.with(|m| m.borrow().range(height..).next().is_some())
+}
+
 pub fn mem_statistic_runes() -> u64 {
   HEIGHT_TO_STATISTIC_RUNES.with(|m| {
     m.borrow()
