@@ -92,6 +92,13 @@ impl Scheduler {
     }
   }
 
+  /// Lets the next tick try right away, for a `start` after fixing what made attempts
+  /// fail. A running attempt still blocks a second one.
+  pub(crate) fn reset_backoff(&mut self) {
+    self.failures = 0;
+    self.next_attempt_at = 0;
+  }
+
   /// Ends an attempt that trapped. Like a failed `finish`.
   pub(crate) fn release(&mut self, now: u64) {
     self.finish(now, false);
@@ -134,6 +141,7 @@ impl Drop for Attempt {
 pub fn update_index(network: BitcoinNetwork, subscribers: Vec<Principal>) -> Result {
   stop_loop();
   LOOP_GENERATION.set(LOOP_GENERATION.get() + 1);
+  SCHEDULER.with_borrow_mut(|s| s.reset_backoff());
   let id =
     ic_cdk_timers::set_timer_interval(POLL_INTERVAL, move || tick(network, subscribers.clone()));
   LOOP_TIMER.with(|t| *t.borrow_mut() = Some(id));
@@ -787,6 +795,28 @@ mod tests {
     assert!(s.idle());
     assert!(!s.begin(60 * SEC), "backoff runs from the trap");
     assert!(s.begin(65 * SEC));
+  }
+
+  #[test]
+  fn scheduler_reset_backoff_retries_at_once_but_keeps_a_running_attempt() {
+    let mut s = Scheduler::default();
+    for i in 0..6 {
+      let now = s.next_attempt_at;
+      assert!(s.begin(now));
+      s.finish(now + i, false);
+    }
+    let now = s.next_attempt_at - SEC;
+    assert!(!s.begin(now), "deep in backoff");
+    s.reset_backoff();
+    assert!(s.begin(now), "start clears the backoff");
+    s.reset_backoff();
+    assert!(!s.begin(now), "a running attempt still blocks a second one");
+    s.finish(now, false);
+    assert_eq!(
+      s.retry_in(now),
+      retry_delay(0),
+      "failure after a reset backs off from scratch"
+    );
   }
 
   #[test]
